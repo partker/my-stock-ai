@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import requests
 from bs4 import BeautifulSoup
-import FinanceDataReader as fdr
 import yfinance as yf
 import plotly.graph_objects as go
 from datetime import datetime, timedelta, date
@@ -11,7 +10,7 @@ from google import genai
 import re
 import os
 
-st.set_page_config(page_title="AI 글로벌 월가 트레이딩 & 매도 시그널 (터보)", page_icon="🌍", layout="wide")
+st.set_page_config(page_title="AI 글로벌 월가 트레이딩 & 매도 시그널", page_icon="🌍", layout="wide")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -32,7 +31,6 @@ def save_portfolio(data_list):
     df = pd.DataFrame(data_list)
     df.to_csv(PORTFOLIO_FILE, index=False, encoding="utf-8-sig")
 
-# 세션 상태 초기화
 if "main_mode" not in st.session_state:
     st.session_state.main_mode = "💼 내 보유 종목 & 매도 시그널"
 if "target_stock" not in st.session_state:
@@ -79,12 +77,22 @@ GLOBAL_KOR_MAP = {
     "도요타": "TM", "소니": "SONY", "닌텐도": "NTDOY"
 }
 
-@st.cache_data(ttl=86400)
-def get_krx_list():
+# 한국 종목명을 네이버 금융 자동완성 API로 초고속 검색
+def search_naver_stock(query):
     try:
-        return fdr.StockListing('KRX')
+        url = f"https://ac.stock.naver.com/ac?q={requests.utils.quote(query)}&target=stock"
+        r = requests.get(url, headers=HEADERS, timeout=4)
+        if r.status_code == 200:
+            items = r.json().get("items", [])
+            for item in items:
+                code = item.get("code", "")
+                name = item.get("name", "")
+                nation = item.get("nationCode", "")
+                if nation == "KOR" and re.match(r'^\d{6}$', code):
+                    return code, name
     except Exception:
-        return pd.DataFrame()
+        pass
+    return None, None
 
 @st.cache_data(ttl=3600)
 def resolve_stock_query(query):
@@ -96,21 +104,14 @@ def resolve_stock_query(query):
         return ticker, f"{q} ({ticker})", "GLOBAL"
 
     if re.match(r'^\d{6}$', q):
-        df = get_krx_list()
-        if not df.empty and 'Code' in df.columns:
-            exact = df[df['Code'] == q]
-            if not exact.empty:
-                return q, exact.iloc[0]['Name'], "KR"
-        return q, q, "KR"
+        code, name = search_naver_stock(q)
+        return q, (name or q), "KR"
 
-    df = get_krx_list()
-    if not df.empty and 'Name' in df.columns:
-        exact = df[df['Name'].str.upper() == q_upper]
-        if not exact.empty:
-            return exact.iloc[0]['Code'], exact.iloc[0]['Name'], "KR"
-        partial = df[df['Name'].str.contains(q, case=False, na=False)]
-        if not partial.empty:
-            return partial.iloc[0]['Code'], partial.iloc[0]['Name'], "KR"
+    # 한글 포함 시 한국 증시 우선 검색
+    if re.search(r'[가-힣]', q):
+        code, name = search_naver_stock(q)
+        if code:
+            return code, name, "KR"
 
     if re.match(r'^[A-Za-z.\-]{1,10}$', q):
         try:
@@ -188,16 +189,21 @@ def call_gemini_ai(api_key, prompt):
             continue
     return f"❌ AI 호출 오류: {last_err}"
 
-# [터보 최적화 1] 주가 데이터 단독 10분 캐싱 (탭 이동·재검색 시 0.1초 즉시 응답)
+# yfinance 단독 주가 수집기 (코스피 .KS / 코스닥 .KQ 자동 판별)
 @st.cache_data(ttl=600)
 def fetch_cached_price(code, market_type, days=150):
-    start_dt = (datetime.today() - timedelta(days=days)).strftime('%Y-%m-%d')
     if market_type == "KR":
-        return fdr.DataReader(code, start_dt)
+        for suffix in [".KS", ".KQ"]:
+            try:
+                df = yf.Ticker(f"{code}{suffix}").history(period="6mo")
+                if df is not None and not df.empty:
+                    return df
+            except Exception:
+                continue
+        return pd.DataFrame()
     else:
         return yf.Ticker(code).history(period="6mo")
 
-# [터보 최적화 2] 한국 주식 데이터 10분 스냅샷 캐싱 + PER/PBR 3중 백업
 @st.cache_data(ttl=600)
 def get_kr_data(code):
     price_df = fetch_cached_price(code, "KR", 120)
@@ -208,19 +214,6 @@ def get_kr_data(code):
         cur_price_num = int(price_df['Close'].iloc[-1])
         info["현재가"] = f"{cur_price_num:,}원"
 
-    # 1차: KRX 상장 데이터에서 시가총액 및 기본 PER/PBR 확인
-    krx_df = get_krx_list()
-    market_suffix = ".KS"
-    if not krx_df.empty and 'Code' in krx_df.columns:
-        row = krx_df[krx_df['Code'] == code]
-        if not row.empty:
-            if 'Marcap' in row.columns and pd.notna(row.iloc[0]['Marcap']):
-                mcap_eok = int(float(row.iloc[0]['Marcap']) // 100000000)
-                info["시가총액"] = f"{mcap_eok:,}억"
-            if 'Market' in row.columns and 'KOSDAQ' in str(row.iloc[0]['Market']).upper():
-                market_suffix = ".KQ"
-
-    # 2차: 네이버 증권 크롤링 (타임아웃 4초 제한으로 무한 로딩 방지)
     url = f"https://finance.naver.com/item/main.naver?code={code}"
     fin_df = pd.DataFrame()
     try:
@@ -257,7 +250,6 @@ def get_kr_data(code):
     except Exception:
         pass
 
-    # 3차 백업: 재무제표 표(PER, PBR, BPS 행)에서 직접 추출
     if (info["PER"] == "N/A" or info["PBR"] == "N/A") and not fin_df.empty:
         try:
             first_col = fin_df.columns[0]
@@ -284,20 +276,24 @@ def get_kr_data(code):
         except Exception:
             pass
 
-    # 4차 백업: 해외 코랩 서버에서 네이버가 차단될 경우 Yahoo Finance(005930.KS 등)에서 즉시 보완
-    if info["PER"] == "N/A" or info["PBR"] == "N/A":
-        try:
-            yf_kr = yf.Ticker(f"{code}{market_suffix}").info
-            if info["PER"] == "N/A":
-                yf_per = yf_kr.get("trailingPE") or yf_kr.get("forwardPE")
-                if yf_per and yf_per > 0:
-                    info["PER"] = f"{yf_per:.2f}배"
-            if info["PBR"] == "N/A":
-                yf_pbr = yf_kr.get("priceToBook")
-                if yf_pbr and yf_pbr > 0:
-                    info["PBR"] = f"{yf_pbr:.2f}배"
-        except Exception:
-            pass
+    if info["PER"] == "N/A" or info["PBR"] == "N/A" or info["시가총액"] == "N/A":
+        for suffix in [".KS", ".KQ"]:
+            try:
+                yf_kr = yf.Ticker(f"{code}{suffix}").info
+                if yf_kr and yf_kr.get("marketCap"):
+                    if info["시가총액"] == "N/A":
+                        info["시가총액"] = f"{int(yf_kr['marketCap'] // 100000000):,}억"
+                    if info["PER"] == "N/A":
+                        yf_per = yf_kr.get("trailingPE") or yf_kr.get("forwardPE")
+                        if yf_per and yf_per > 0:
+                            info["PER"] = f"{yf_per:.2f}배"
+                    if info["PBR"] == "N/A":
+                        yf_pbr = yf_kr.get("priceToBook")
+                        if yf_pbr and yf_pbr > 0:
+                            info["PBR"] = f"{yf_pbr:.2f}배"
+                    break
+            except Exception:
+                continue
 
     if info["PER"] == "N/A":
         info["PER"] = "적자/성장주 (PER 미산출)"
@@ -341,7 +337,6 @@ def get_kr_data(code):
 
     return info, fin_df, supply_df, news_list, price_df
 
-# [터보 최적화 3] 글로벌 주식 데이터 10분 스냅샷 캐싱
 @st.cache_data(ttl=600)
 def get_global_data(ticker):
     t = yf.Ticker(ticker)
@@ -420,7 +415,6 @@ def get_global_data(ticker):
 
     return info, fin_df, supply_df, news_list, price_df
 
-# 보유 종목 매도 시그널 판별 (캐싱된 주가 데이터 재사용으로 0.1초 처리)
 def evaluate_sell_signals(item):
     code = item["code"]
     market_type = item["market_type"]
@@ -615,7 +609,6 @@ def scan_market_universe_cached(market_choice):
         res_df = res_df.sort_values(by="퀀트점수", ascending=False).reset_index(drop=True)
     return res_df
 
-# [터보 최적화 4] 몬테카를로 시뮬레이션 2,000회 다이어트 (연산 속도 5배 향상 + 10분 캐싱)
 @st.cache_data(ttl=600)
 def run_day_trader_simulation(price_df, target_pct=10.0, stop_pct=-5.0, days=20, n_sims=2000):
     if price_df is None or price_df.empty or len(price_df) < 20:
@@ -689,9 +682,9 @@ with st.sidebar:
     stop_pct = st.slider("손절 기준선 (%)", -20.0, -2.0, -5.0, 1.0)
     sim_days = st.slider("보유 기간 (거래일)", 5, 60, 20, 5)
     st.divider()
-    st.caption("⚡ 터보 모드 작동 중: 2,000회 고속 연산 & 10분 스냅샷 캐싱 적용")
+    st.caption("⚡ 터보 모드: 2,000회 고속 연산 & 10분 스냅샷 캐싱")
 
-st.title("🌍 AI 글로벌 월가 트레이딩 & 매도 타이밍 알리미 (⚡터보)")
+st.title("🌍 AI 글로벌 월가 트레이딩 & 매도 타이밍 알리미")
 st.caption("내 보유 종목 매도 시그널(트레일링 스탑·과열·생명선 이탈) · 오늘의 주목 종목 스캐너 · 2,000회 고속 시뮬레이션")
 
 fear_data = get_fear_indices()
@@ -717,9 +710,6 @@ mode = st.radio(
 st.session_state.main_mode = mode
 st.divider()
 
-# =========================================================================
-# [1. 💼 내 보유 종목 & 매도 시그널 탭]
-# =========================================================================
 if st.session_state.main_mode == "💼 내 보유 종목 & 매도 시그널":
     st.subheader("💼 내 보유 종목 기억 & 실시간 매도 타이밍 판별기")
     st.caption("종목과 매수 평단가를 등록해 두면 ① 트레일링 스탑(고점 대비 하락 방어선) ② 단기 고점 과열(50% 분할 익절) ③ 20일 생명선·지지선 이탈(전량 매도) 신호를 자동 감시합니다.")
@@ -844,12 +834,9 @@ if st.session_state.main_mode == "💼 내 보유 종목 & 매도 시그널":
 """
                                 st.info(call_gemini_ai(api_key, sell_prompt))
 
-# =========================================================================
-# [2. 🔥 AI 주목 종목 스캐너 & 추천 탭]
-# =========================================================================
 elif st.session_state.main_mode == "🔥 AI 주목 종목 스캐너 & 추천":
     st.subheader("🔥 오늘의 주목할 만한 종목 추천 (AI 실시간 퀀트 스캐너)")
-    st.caption("국내·미국 대표 주도주 유니버스의 실시간 거래량 급증률, RSI(14), 20일 지지/저항선 돌파 여부를 스캔하여 TOP 3 종목을 발굴합니다. (10분 캐싱 적용)")
+    st.caption("국내·미국 대표 주도주 유니버스의 실시간 거래량 급증률, RSI(14), 20일 지지/저항선 돌파 여부를 스캔하여 TOP 3 종목을 발굴합니다.")
 
     sc_col1, sc_col2 = st.columns([2, 1])
     with sc_col1:
@@ -867,12 +854,12 @@ elif st.session_state.main_mode == "🔥 AI 주목 종목 스캐너 & 추천":
             st.error("👈 왼쪽 사이드바에 Gemini API Key를 먼저 입력해 주세요!")
             st.stop()
 
-        with st.spinner("⚡ 24개 핵심 종목 실시간 데이터 고속 스캔 중 (10분 이내 재실행 시 0.1초 완료)..."):
+        with st.spinner("⚡ 24개 핵심 종목 실시간 데이터 고속 스캔 중..."):
             df_scanned = scan_market_universe_cached(market_choice)
             st.session_state.scan_df = df_scanned
 
         if not df_scanned.empty:
-            with st.spinner("🤖 월가 AI 헤지펀드 위원회가 스캔된 수치를 바탕으로 TOP 3 종목을 선정 중입니다..."):
+            with st.spinner("🤖 월가 AI 헤지펀드 위원회가 TOP 3 종목을 선정 중입니다..."):
                 scan_prompt = f"""
 너는 월가 퀀트 헤지펀드의 수석 포트폴리오 매니저야.
 절대 너의 예전 기억으로 주가를 추측하지 말고, 방금 파이썬 스캐너가 실시간으로 수집한 [종목별 기술적 지표·거래량·RSI 요약 표]와 [현재 시장 공포지수]만을 근거로 오늘 가장 주목해야 할 **핵심 종목 TOP 3**를 선정해줘.
@@ -927,9 +914,6 @@ elif st.session_state.main_mode == "🔥 AI 주목 종목 스캐너 & 추천":
                 st.session_state.auto_run_detail = True
                 st.rerun()
 
-# =========================================================================
-# [3. 🔍 개별 종목 정밀 분석기 탭]
-# =========================================================================
 else:
     col_in, col_btn = st.columns([3, 1])
     with col_in:
@@ -962,7 +946,6 @@ else:
             unit = basic_info.get("통화", "")
             sim_res = run_day_trader_simulation(price_df, target_pct, stop_pct, sim_days, 2000)
 
-        # 요약 카드와 차트 탭을 AI 대기 전에 먼저 렌더링하여 체감 속도 향상
         st.subheader(f"🏢 [{badge}] {name} ({code}) 실시간 핵심 요약")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("현재가", basic_info["현재가"])
