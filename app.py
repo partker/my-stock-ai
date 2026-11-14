@@ -77,7 +77,6 @@ GLOBAL_KOR_MAP = {
     "도요타": "TM", "소니": "SONY", "닌텐도": "NTDOY"
 }
 
-# 한국 종목명을 네이버 금융 자동완성 API로 초고속 검색
 def search_naver_stock(query):
     try:
         url = f"https://ac.stock.naver.com/ac?q={requests.utils.quote(query)}&target=stock"
@@ -107,7 +106,6 @@ def resolve_stock_query(query):
         code, name = search_naver_stock(q)
         return q, (name or q), "KR"
 
-    # 한글 포함 시 한국 증시 우선 검색
     if re.search(r'[가-힣]', q):
         code, name = search_naver_stock(q)
         if code:
@@ -171,25 +169,42 @@ def get_fear_indices():
     return result
 
 def call_gemini_ai(api_key, prompt):
-    client = genai.Client(api_key=api_key)
-    candidate_models = [
-        "gemini-3.8-flash",
-        "gemini-3-flash-preview",
-        "gemini-3.0-flash",
-        "gemini-2.5-flash",
-        "gemini-2.0-flash"
-    ]
-    last_err = ""
-    for m in candidate_models:
-        try:
-            res = client.models.generate_content(model=m, contents=prompt)
-            return res.text
-        except Exception as e:
-            last_err = str(e)
-            continue
-    return f"❌ AI 호출 오류: {last_err}"
+    clean_key = api_key.strip()
+    client = genai.Client(api_key=clean_key)
 
-# yfinance 단독 주가 수집기 (코스피 .KS / 코스닥 .KQ 자동 판별)
+    available_models = []
+    try:
+        for m in client.models.list():
+            name = m.name.replace("models/", "")
+            if ("flash" in name or "gemini" in name) and "embedding" not in name and "imagen" not in name and "vision" not in name:
+                available_models.append(name)
+    except Exception as e:
+        return f"❌ API 키 인증 또는 모델 목록 조회 실패 (API 키를 다시 확인해 주세요): {e}"
+
+    preferred_order = [
+        "gemini-3.8-flash",
+        "models/gemini-3.8-flash",
+        "gemini-3.8-flash-preview",
+        "gemini-3-flash",
+        "gemini-3.0-flash",
+    ]
+    for m in sorted(available_models, reverse=True):
+        if m not in preferred_order:
+            preferred_order.append(m)
+
+    errors = {}
+    for model_name in preferred_order:
+        try:
+            res = client.models.generate_content(model=model_name, contents=prompt)
+            if res and res.text:
+                return res.text
+        except Exception as e:
+            errors[model_name] = str(e)
+            continue
+
+    first_err = errors.get("gemini-3.8-flash") or next(iter(errors.values()), "알 수 없는 오류")
+    return f"❌ AI 호출 오류 (내 키에서 감지된 모델: {available_models[:5]}): {first_err}"
+
 @st.cache_data(ttl=600)
 def fetch_cached_price(code, market_type, days=150):
     if market_type == "KR":
@@ -671,11 +686,23 @@ def run_day_trader_simulation(price_df, target_pct=10.0, stop_pct=-5.0, days=20,
         "sample_paths": price_paths[:, :40]
     }
 
-# ================= 사이드바 UI =================
+# ================= 사이드바 UI (Streamlit Secrets 자동 연동) =================
 with st.sidebar:
     st.header("🔑 AI 설정")
-    api_key = st.text_input("Gemini API Key 입력", type="password", help="Google AI Studio에서 무료 발급받은 키 입력")
-    st.markdown("[👉 무료 API 키 발급받기](https://aistudio.google.com/app/apikey)")
+    default_key = ""
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            default_key = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        pass
+
+    if default_key:
+        api_key = default_key
+        st.success("✅ 서버에 저장된 API Key가 자동 연결되었습니다!")
+    else:
+        api_key = st.text_input("Gemini API Key 입력", type="password", help="Google AI Studio에서 무료 발급받은 키 입력")
+        st.markdown("[👉 무료 API 키 발급받기](https://aistudio.google.com/app/apikey)")
+
     st.divider()
     st.subheader("🎯 시뮬레이션 목표 설정")
     target_pct = st.slider("목표 수익률 (%)", 3.0, 30.0, 10.0, 1.0)
