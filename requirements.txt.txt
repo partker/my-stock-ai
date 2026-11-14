@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+requests
+beautifulsoup4
+lxml
+finance-datareader
+yfinance
+plotly
+google-genai
