@@ -353,11 +353,12 @@ def get_kr_data(code):
     return info, fin_df, supply_df, news_list, price_df
 
 @st.cache_data(ttl=600)
+@st.cache_data(ttl=600)
 def get_global_data(ticker):
     t = yf.Ticker(ticker)
     yf_info = {}
     try:
-        yf_info = t.info
+        yf_info = t.info or {}
     except Exception:
         pass
 
@@ -367,31 +368,18 @@ def get_global_data(ticker):
     if not cur_p and not price_df.empty:
         cur_p = float(price_df['Close'].iloc[-1])
 
-    mcap = yf_info.get("marketCap")
-    per = yf_info.get("trailingPE") or yf_info.get("forwardPE")
-    pbr = yf_info.get("priceToBook")
-
-    info = {
-        "현재가": f"{cur_p:,.2f} {currency}" if cur_p else "확인불가",
-        "시가총액": f"{mcap / 1e9:,.1f}B {currency}" if mcap else "N/A",
-        "PER": f"{per:.2f}배" if per else "적자/성장주 (미산출)",
-        "PBR": f"{pbr:.2f}배" if pbr else "N/A",
-        "통화": currency,
-        "ROE": f"{yf_info.get('returnOnEquity', 0)*100:.1f}%" if yf_info.get('returnOnEquity') else "N/A",
-        "부채비율(D/E)": f"{yf_info.get('debtToEquity', 'N/A')}%",
-        "월가목표주가(평균)": f"{yf_info.get('targetMeanPrice', 'N/A')} {currency}",
-        "월가투자의견": yf_info.get("recommendationKey", "N/A").upper()
-    }
-
+    # 재무제표(손익계산서 & 대차대조표) 먼저 로드
+    inc = pd.DataFrame()
+    bal = pd.DataFrame()
     fin_df = pd.DataFrame()
     try:
         inc = t.income_stmt
         bal = t.balance_sheet
         if inc is not None and not inc.empty:
-            keep_rows = [r for r in ['Total Revenue', 'Operating Income', 'Net Income', 'Diluted EPS'] if r in inc.index]
+            keep_rows = [r for r in ['Total Revenue', 'Operating Income', 'Net Income', 'Diluted EPS', 'Basic Average Shares'] if r in inc.index]
             sub_inc = inc.loc[keep_rows]
             if bal is not None and not bal.empty:
-                bal_rows = [r for r in ['Total Assets', 'Total Debt', 'Stockholders Equity'] if r in bal.index]
+                bal_rows = [r for r in ['Total Assets', 'Total Debt', 'Total Liabilities Net Minority Interest', 'Stockholders Equity', 'Ordinary Shares Number'] if r in bal.index]
                 sub_bal = bal.loc[bal_rows]
                 fin_df = pd.concat([sub_inc, sub_bal])
             else:
@@ -400,14 +388,80 @@ def get_global_data(ticker):
     except Exception:
         pass
 
+    # 재무제표에서 최신 숫자 추출 도우미
+    def get_latest_fin_val(df_target, row_names):
+        if df_target is None or df_target.empty:
+            return None
+        for rname in row_names:
+            if rname in df_target.index:
+                for val in df_target.loc[rname]:
+                    try:
+                        v = float(val)
+                        if not np.isnan(v) and v != 0:
+                            return v
+                    except Exception:
+                        continue
+        return None
+
+    net_income = get_latest_fin_val(inc, ['Net Income', 'Net Income Common Stockholders'])
+    equity = get_latest_fin_val(bal, ['Stockholders Equity', 'Total Equity Gross Minority Interest', 'Common Stock Equity'])
+    total_debt = get_latest_fin_val(bal, ['Total Debt', 'Total Liabilities Net Minority Interest'])
+    shares = yf_info.get("sharesOutstanding") or get_latest_fin_val(bal, ['Ordinary Shares Number', 'Share Issued']) or get_latest_fin_val(inc, ['Basic Average Shares', 'Diluted Average Shares'])
+
+    # 1. 시가총액 (t.info 우선, 없으면 주가 x 발행주식수로 역산)
+    mcap = yf_info.get("marketCap")
+    if not mcap and cur_p and shares:
+        mcap = cur_p * shares
+
+    # 2. PER (t.info 우선, 없으면 시가총액 / 당기순이익으로 역산)
+    per = yf_info.get("trailingPE") or yf_info.get("forwardPE")
+    if not per and mcap and net_income and net_income > 0:
+        per = mcap / net_income
+
+    # 3. PBR (t.info 우선, 없으면 시가총액 / 자본총계로 역산)
+    pbr = yf_info.get("priceToBook")
+    if not pbr and mcap and equity and equity > 0:
+        pbr = mcap / equity
+
+    # 4. ROE (t.info 우선, 없으면 당기순이익 / 자본총계로 역산)
+    roe = yf_info.get("returnOnEquity")
+    if roe is None and net_income is not None and equity and equity > 0:
+        roe = net_income / equity
+
+    # 5. 부채비율 D/E (t.info 우선, 없으면 총부채 / 자본총계로 역산)
+    de_ratio = yf_info.get("debtToEquity")
+    if de_ratio is None and total_debt is not None and equity and equity > 0:
+        de_ratio = (total_debt / equity) * 100
+
+    # 6. 월가 목표주가 & 투자의견 (t.info 막혔을 때 analyst_price_targets 백업)
+    target_mean = yf_info.get("targetMeanPrice")
+    rec_key = yf_info.get("recommendationKey")
+    try:
+        if not target_mean and hasattr(t, "analyst_price_targets") and t.analyst_price_targets:
+            target_mean = t.analyst_price_targets.get("mean")
+    except Exception:
+        pass
+
+    info = {
+        "현재가": f"{cur_p:,.2f} {currency}" if cur_p else "확인불가",
+        "시가총액": f"{mcap / 1e9:,.1f}B {currency}" if mcap else "N/A",
+        "PER": f"{per:.2f}배" if (per and per > 0) else ("적자 기업 (PER 미산출)" if (net_income is not None and net_income <= 0) else "N/A"),
+        "PBR": f"{pbr:.2f}배" if (pbr and pbr > 0) else "N/A",
+        "통화": currency,
+        "ROE": f"{roe * 100:.1f}%" if roe is not None else "N/A",
+        "부채비율(D/E)": f"{de_ratio:.1f}%" if de_ratio is not None else "N/A",
+        "월가목표주가(평균)": f"{target_mean:,.2f} {currency}" if target_mean else "집계중",
+        "월가투자의견": rec_key.upper() if rec_key else "컨센서스 집계중"
+    }
+
     supply_df = pd.DataFrame()
     try:
         inst_pct = yf_info.get("heldPercentInstitutions")
         ins_pct = yf_info.get("heldPercentInsiders")
         short_ratio = yf_info.get("shortRatio")
         summary_rows = [
-            {"항목": "글로벌 기관투자자 보유 비중", "수치": f"{inst_pct*100:.2f}%" if inst_pct else "N/A"},
-            {"항목": "내부자(경영진) 보유 비중", "수치": f"{ins_pct*100:.2f}%" if ins_pct else "N/A"},
+            {"항목": "글로벌 기관투자자 보유 비중", "수치": f"{inst_pct*100:.2f}%" if inst_pct else "재무제표 기반 분석"},
+            {"항목": "내부자(경영진) 보유 비중", "수치": f"{ins_pct*100:.2f}%" if ins_pct else "재무제표 기반 분석"},
             {"항목": "공매도 커버 비율 (Short Ratio)", "수치": f"{short_ratio}" if short_ratio else "N/A"},
             {"항목": "월가 애널리스트 평균 목표가", "수치": info["월가목표주가(평균)"]},
             {"항목": "월가 컨센서스 의견", "수치": info["월가투자의견"]}
